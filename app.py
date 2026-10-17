@@ -18,6 +18,8 @@ from flask import Flask, jsonify, request
 
 # ===== 설정 =====
 KEYWORD = os.environ.get("KEYWORD", "줄")
+# 쉼표로 여러 개 가능 (예: "신청,완료" → 신청 인원, 완료 인원을 따로 셈)
+KEYWORDS = [k.strip() for k in KEYWORD.split(",") if k.strip()] or ["줄"]
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "")  # Render 환경변수에 관리자 비밀번호 설정 (비우면 비밀번호 없음)
 CACHE_SEC = 5      # 같은 글은 5초 동안 저장된 결과 재사용 (디시 요청 줄이기)
 MAX_CACHE = 50     # 동시에 기억할 게시글 수
@@ -176,14 +178,25 @@ def is_real(c):
     return True
 
 
-def count_people(comments, contain):
-    """'줄' 단 사람 집계 (같은 사람은 1명으로)"""
+# 키워드별 추가 인정 패턴 (예: "총공완", "지각완"처럼 '완'으로 끝나면 완료로 인정)
+KEYWORD_ALIASES = {"완료": [re.compile(r"완$")]}
+
+
+def matches(text, k, contain):
+    if (k in text) if contain else (text == k):
+        return True
+    return any(p.search(text) for p in KEYWORD_ALIASES.get(k, []))
+
+
+def count_people(comments, contain, keywords=None):
+    """키워드 단 사람 집계 (같은 사람은 1명으로)"""
+    keywords = keywords or KEYWORDS
     people = {}
     for c in comments:
         if not is_real(c):
             continue  # 광고·삭제 댓글 제외
         text = clean(c.get("memo"))
-        hit = KEYWORD in text if contain else text == KEYWORD
+        hit = any(matches(text, k, contain) for k in keywords)
         if not hit:
             continue
         uid = c.get("user_id")
@@ -220,9 +233,14 @@ def api_count():
         return jsonify(ok=False, error=str(e)), 400
     try:
         entry = get_comments_cached(url, gal_id, post_no, gal_type)
-        people = count_people(entry["data"], contain)
+        # 키워드별로 따로 집계 (예: 신청 33명, 완료 12명)
+        groups = []
+        for k in KEYWORDS:
+            ppl = count_people(entry["data"], contain, [k])
+            groups.append({"kw": k, "count": len(ppl), "people": ppl})
         updated = time.strftime("%H:%M:%S", time.gmtime(entry["time"] + 9 * 3600))
-        return jsonify(ok=True, url=url, count=len(people), people=people,
+        return jsonify(ok=True, url=url, groups=groups,
+                       count=groups[0]["count"], people=groups[0]["people"],
                        total=sum(1 for c in entry["data"] if is_real(c)), updated=updated)
     except Exception as e:
         return jsonify(ok=False, error=f"디시에서 댓글을 못 가져왔어 ({e})"), 502
@@ -406,6 +424,10 @@ PAGE = """<!doctype html>
  .card{background:#fff;border-radius:14px;padding:16px;box-shadow:0 4px 16px rgba(0,0,0,.08)}
  .zone{font-size:17px;font-weight:bold;color:#3b4890}
  .num{font-size:52px;font-weight:bold;margin:4px 0 0}
+ .nums{display:flex;gap:22px;flex-wrap:wrap}
+ .lbl{font-size:13px;color:#888;margin-top:6px}
+ .multi .num{font-size:42px;margin:0}
+ .multi .n1 .num{color:#2e7d5b}
  .st{font-size:12px;color:#888;margin-top:4px}
  .err{color:#c33}
  .empty{text-align:center;color:#888;padding:40px 0}
@@ -437,6 +459,8 @@ PAGE = """<!doctype html>
   .card{padding:10px 12px;border-radius:10px}
   .zone{font-size:14px}
   .num{font-size:30px;margin:2px 0 0}
+  .nums{gap:12px} .lbl{font-size:11px;margin-top:2px}
+  .multi .num{font-size:24px}
   .st{font-size:10px;margin-top:2px}
   details,a{font-size:11px} details{margin-top:2px}
  }
@@ -463,13 +487,14 @@ PAGE = """<!doctype html>
   </div>
  </div>
 
- <div class="top"><div class="sum">전체 합계 <b id="total">0</b>명</div></div>
+ <div class="top"><div class="sum" id="total">전체 합계 <b>0</b>명</div></div>
  <div class="grid" id="grid"></div>
  <div class="empty hide" id="empty">아직 등록된 구역이 없어. 아래 관리자 버튼을 눌러 링크를 넣어줘.</div>
  <div class="foot"><button id="adminbtn">관리자</button></div>
 </div>
 <script>
 const MAX=5;
+const KWS=__KWS__;  // 서버의 KEYWORD 설정 (예: ["신청","완료"])
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"]/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[ch]));
 const store={
@@ -588,10 +613,10 @@ function render(){
   $('grid').innerHTML=list.map(s=>`
     <div class="card" data-url="${esc(s.url)}">
       <div class="zone">${esc(s.name||('구역 '+(s.i+1)))}</div>
-      <div class="num">-</div>
+      <div class="nums ${KWS.length>1?'multi':''}">${KWS.map((k,j)=>`<div class="n${j}">${KWS.length>1?`<div class="lbl">${esc(k)}</div>`:''}<div class="num">-</div></div>`).join('')}</div>
       <div class="st">불러오는 중... (서버가 자고 있었으면 최대 1분)</div>
       <a href="${esc(postLink(s.url))}" target="_blank">원본 게시물 보기</a>
-      <details><summary>명단 보기</summary><ol></ol></details>
+      ${KWS.map(k=>`<details><summary>${KWS.length>1?esc(k)+' ':''}명단 보기</summary><ol></ol></details>`).join('')}
     </div>`).join('');
   list.forEach(s=>{ if(counts[s.url]) paint(s.url); });
   sum();
@@ -603,10 +628,13 @@ function paint(url){
   if(!card||!d) return;
   const st=card.querySelector('.st');
   if(d.ok){
-    card.querySelector('.num').textContent=d.count+'명';
+    const nums=card.querySelectorAll('.num'), ols=card.querySelectorAll('ol');
+    (d.groups||[{count:d.count,people:d.people}]).forEach((g,j)=>{
+      if(nums[j]) nums[j].textContent=g.count+'명';
+      if(ols[j]) ols[j].innerHTML=g.people.map(p=>'<li>'+esc(p.name)+' <span class="t">'+esc(p.time)+'</span></li>').join('');
+    });
     st.className='st';
     st.textContent='전체 댓글 '+d.total+'개 · 갱신 '+d.updated;
-    card.querySelector('ol').innerHTML=d.people.map(p=>'<li>'+esc(p.name)+' <span class="t">'+esc(p.time)+'</span></li>').join('');
   }else{
     st.className='st err';
     st.textContent='오류: '+d.error;
@@ -614,7 +642,14 @@ function paint(url){
 }
 
 function sum(){
-  $('total').textContent=shared.slots.reduce((a,s)=>a+((s.url&&counts[s.url]&&counts[s.url].ok)?counts[s.url].count:0),0);
+  const tot=KWS.map(()=>0);
+  shared.slots.forEach(s=>{
+    const d=s.url&&counts[s.url];
+    if(d&&d.ok) (d.groups||[{count:d.count}]).forEach((g,j)=>{ tot[j]+=g.count; });
+  });
+  $('total').innerHTML = KWS.length>1
+    ? KWS.map((k,j)=>`${esc(k)} 합계 <b>${tot[j]}</b>명`).join(' · ')
+    : `전체 합계 <b>${tot[0]}</b>명`;
 }
 
 function apply(d,force){
@@ -664,7 +699,7 @@ setInterval(tick,5000);
 
 @app.route("/")
 def index():
-    return PAGE.replace("__KW__", KEYWORD)
+    return PAGE.replace("__KWS__", json.dumps(KEYWORDS, ensure_ascii=False)).replace("__KW__", "/".join(KEYWORDS))
 
 
 if __name__ == "__main__":
