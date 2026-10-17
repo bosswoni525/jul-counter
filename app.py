@@ -411,6 +411,17 @@ $('restore').onclick=()=>{
   try{ const b=JSON.parse(store.get('jul_backup')); saveSlots(b.slots||[],!!b.contain); }catch(e){}
 };
 
+// 폰이면 모바일 디시 주소로 → 디시 앱이 깔려 있으면 앱으로 열릴 수 있음
+const isMobile=/Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+function postLink(url){
+  if(!isMobile) return url;
+  try{
+    const u=new URL(url), id=u.searchParams.get('id'), no=u.searchParams.get('no');
+    const kind=u.pathname.startsWith('/mini/')?'mini':'board';
+    return `https://m.dcinside.com/${kind}/${id}/${no}`;
+  }catch(e){ return url; }
+}
+
 // ===== 보는 화면 =====
 function render(){
   const list=shared.slots.map((s,i)=>({...s,i})).filter(s=>s.url);
@@ -420,7 +431,7 @@ function render(){
       <div class="zone">${esc(s.name||('구역 '+(s.i+1)))}</div>
       <div class="num">-</div>
       <div class="st">불러오는 중... (서버가 자고 있었으면 최대 1분)</div>
-      <a href="${esc(s.url)}" target="_blank">원본 게시물 보기</a>
+      <a href="${esc(postLink(s.url))}" target="_blank">원본 게시물 보기</a>
       <details><summary>명단 보기</summary><ol></ol></details>
     </div>`).join('');
   list.forEach(s=>{ if(counts[s.url]) paint(s.url); });
