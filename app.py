@@ -445,6 +445,10 @@ PAGE = """<!doctype html>
  .abtn button{padding:9px 14px;border:0;border-radius:8px;background:#3b4890;color:#fff;font-size:13px;cursor:pointer}
  .abtn button.gray{background:#e3e5f0;color:#444}
  .hide{display:none}
+ .copybtns{display:flex;gap:6px;margin-top:10px;flex-wrap:wrap}
+ .cbtn{flex:1;min-width:0;padding:9px 6px;border:1px solid #c9cdea;border-radius:8px;background:#eef0fa;color:#3b4890;font-size:13px;cursor:pointer;white-space:nowrap}
+ .cbtn.done{background:#3b4890;color:#fff}
+ @media (max-width:600px){ .copybtns{flex-direction:column;gap:4px;margin-top:6px} .cbtn{font-size:12px;padding:7px 4px} }
  .bili{display:flex;gap:6px;margin-bottom:4px}
  .bili input{flex:1;min-width:0;padding:9px;border:1px solid #ccd;border-radius:8px;font-size:14px}
  .bili button{padding:9px 14px;border:0;border-radius:8px;background:#3b4890;color:#fff;font-size:13px;cursor:pointer;white-space:nowrap}
@@ -625,6 +629,32 @@ function openApp(url){
   }
 }
 
+// ===== 댓글 문구 복사 버튼 =====
+const COPY_TEXTS=['신청합니다','총공완료 했습니다'];
+function copyText(t){
+  // 앱 내 브라우저 등 clipboard API가 막힌 곳을 위해 예비 방법도 사용
+  const fallback=()=>{
+    const ta=document.createElement('textarea');
+    ta.value=t; ta.setAttribute('readonly',''); ta.style.position='fixed'; ta.style.opacity='0';
+    document.body.appendChild(ta); ta.select(); ta.setSelectionRange(0,t.length);
+    let ok=false; try{ ok=document.execCommand('copy'); }catch(e){}
+    ta.remove(); return ok;
+  };
+  if(navigator.clipboard && window.isSecureContext){
+    return navigator.clipboard.writeText(t).then(()=>true).catch(fallback);
+  }
+  return Promise.resolve(fallback());
+}
+document.addEventListener('click',e=>{
+  const b=e.target.closest('.cbtn'); if(!b) return;
+  const t=b.dataset.t;
+  copyText(t).then(ok=>{
+    b.textContent= ok ? '복사됨!' : '복사 실패';
+    b.classList.add('done');
+    setTimeout(()=>{ b.textContent=t; b.classList.remove('done'); },1200);
+  });
+});
+
 // ===== 보는 화면 =====
 function render(){
   const list=shared.slots.map((s,i)=>({...s,i})).filter(s=>s.url);
@@ -638,6 +668,7 @@ function render(){
         ? `<a href="#" onclick="openApp('${esc(s.url)}');return false;">디시앱으로 열기</a> · <a href="${esc(postLink(s.url))}" target="_blank">웹으로 보기</a>`
         : `<a href="${esc(s.url)}" target="_blank">원본 게시물 보기</a>`}
       ${KWS.map(k=>`<details><summary>${KWS.length>1?esc(k)+' ':''}명단 보기</summary><ol></ol></details>`).join('')}
+      <div class="copybtns">${COPY_TEXTS.map(t=>`<button class="cbtn" data-t="${esc(t)}">${esc(t)}</button>`).join('')}</div>
     </div>`).join('');
   list.forEach(s=>{ if(counts[s.url]) paint(s.url); });
   sum();
