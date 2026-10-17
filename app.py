@@ -606,6 +606,25 @@ function postLink(url){
   }catch(e){ return url; }
 }
 
+// 디시 앱으로 열기 (디시 모바일 웹의 '디시앱' 버튼과 같은 dcapp:// 주소 사용)
+const isAndroid=/Android/i.test(navigator.userAgent);
+const isIOS=/iPhone|iPad|iPod/i.test(navigator.userAgent);
+function openApp(url){
+  const web=postLink(url);                       // https://m.dcinside.com/mini/id/no
+  const path=web.replace('https://','');         // m.dcinside.com/mini/id/no
+  if(isAndroid){
+    // 앱이 없으면 모바일 웹으로 자동 이동
+    location.href=`intent://${path}#Intent;scheme=dcapp;package=com.dcinside.app.android;S.browser_fallback_url=${encodeURIComponent(web)};end`;
+  }else if(isIOS){
+    const t=Date.now();
+    location.href='dcapp://'+path;
+    // 1.5초 안에 앱으로 안 넘어가면 모바일 웹으로
+    setTimeout(()=>{ if(!document.hidden && Date.now()-t<3000) location.href=web; },1500);
+  }else{
+    window.open(url,'_blank');
+  }
+}
+
 // ===== 보는 화면 =====
 function render(){
   const list=shared.slots.map((s,i)=>({...s,i})).filter(s=>s.url);
@@ -615,7 +634,9 @@ function render(){
       <div class="zone">${esc(s.name||('구역 '+(s.i+1)))}</div>
       <div class="nums ${KWS.length>1?'multi':''}">${KWS.map((k,j)=>`<div class="n${j}">${KWS.length>1?`<div class="lbl">${esc(k)}</div>`:''}<div class="num">-</div></div>`).join('')}</div>
       <div class="st">불러오는 중... (서버가 자고 있었으면 최대 1분)</div>
-      <a href="${esc(postLink(s.url))}" target="_blank">원본 게시물 보기</a>
+      ${isMobile
+        ? `<a href="#" onclick="openApp('${esc(s.url)}');return false;">디시앱으로 열기</a> · <a href="${esc(postLink(s.url))}" target="_blank">웹으로 보기</a>`
+        : `<a href="${esc(s.url)}" target="_blank">원본 게시물 보기</a>`}
       ${KWS.map(k=>`<details><summary>${KWS.length>1?esc(k)+' ':''}명단 보기</summary><ol></ol></details>`).join('')}
     </div>`).join('');
   list.forEach(s=>{ if(counts[s.url]) paint(s.url); });
