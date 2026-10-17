@@ -32,7 +32,8 @@ BILJI_RECHECK_SEC = 60                                            # 자동 모�
 # ================
 
 # 모두가 함께 보는 구역 설정 (서버에 저장)
-_shared = {"slots": [], "contain": False, "version": 0, "auto_date": ""}
+# auto_date: "today" = 매일 오늘 빌지 자동 / "YYYY-MM-DD" = 그 날짜 고정 / "" = 직접 입력
+_shared = {"slots": [], "contain": False, "version": 0, "auto_date": "today"}
 _bilji_state = {"last": 0, "running": False}
 _shared_lock = threading.Lock()
 
@@ -42,7 +43,7 @@ def _load_shared():
         with open(SLOTS_FILE, encoding="utf-8") as f:
             data = json.load(f)
         _shared.update(slots=data.get("slots", []), contain=bool(data.get("contain")),
-                       version=int(data.get("version", 0)), auto_date=data.get("auto_date", ""))
+                       version=int(data.get("version", 0)), auto_date=data.get("auto_date", "today"))
     except (OSError, ValueError):
         pass
 
@@ -267,6 +268,11 @@ def kst_today():
     return time.strftime("%Y-%m-%d", time.gmtime(time.time() + 9 * 3600))
 
 
+def resolve_date(key):
+    """'today'면 오늘 날짜(한국 시간)로 바꿈"""
+    return kst_today() if key == "today" else key
+
+
 def zone_name(tag):
     """[P] → [P]구역, [1구역] → 1구역"""
     return tag if "구역" in tag else f"[{tag}]구역"
@@ -314,10 +320,10 @@ def fetch_bilji(date):
     } for x in items]
 
 
-def apply_bilji(date, slots):
+def apply_bilji(key, slots):
     """찾은 빌지를 구역 목록에 반영 (바뀐 게 있을 때만)"""
     with _shared_lock:
-        if _shared.get("auto_date") != date:
+        if _shared.get("auto_date") != key:
             return  # 그사이 관리자가 다른 설정으로 바꿨으면 무시
         old = [(x.get("name"), x.get("url")) for x in _shared["slots"] if x.get("url")]
         new = [(x["name"], x["url"]) for x in slots]
@@ -329,17 +335,18 @@ def apply_bilji(date, slots):
 
 def maybe_recheck_bilji():
     """자동 모드면 1분마다 새 빌지가 올라왔는지 확인 (뒤에서 몰래 실행)"""
-    date = _shared.get("auto_date")
-    if not date or _bilji_state["running"] or time.time() - _bilji_state["last"] < BILJI_RECHECK_SEC:
+    key = _shared.get("auto_date")
+    if not key or _bilji_state["running"] or time.time() - _bilji_state["last"] < BILJI_RECHECK_SEC:
         return
     _bilji_state["running"] = True
     _bilji_state["last"] = time.time()
 
     def run():
         try:
-            slots = fetch_bilji(date)
+            slots = fetch_bilji(resolve_date(key))
+            # 오늘 빌지가 아직 없으면 어제 빌지를 그대로 보여줌 (새 빌지 뜨면 교체)
             if slots:
-                apply_bilji(date, slots)
+                apply_bilji(key, slots)
         except Exception:
             pass
         finally:
@@ -354,15 +361,15 @@ def load_bilji():
     body = request.get_json(silent=True) or {}
     if ADMIN_KEY and body.get("key") != ADMIN_KEY:
         return jsonify(ok=False, error="관리자 비밀번호가 틀렸어"), 403
-    date = str(body.get("date") or kst_today())
-    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+    key = str(body.get("date") or "today")
+    if key != "today" and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", key):
         return jsonify(ok=False, error="날짜 형식이 이상해"), 400
     try:
-        slots = fetch_bilji(date)
+        slots = fetch_bilji(resolve_date(key))
     except Exception as e:
         return jsonify(ok=False, error=f"디시 목록을 못 가져왔어 ({e})"), 502
     with _shared_lock:
-        _shared["auto_date"] = date
+        _shared["auto_date"] = key
         if slots:
             _shared["slots"] = slots
         _shared["version"] += 1
@@ -441,9 +448,10 @@ PAGE = """<!doctype html>
   <h2>📅 날짜로 빌지 불러오기</h2>
   <div class="bili">
    <input type="date" id="bd">
-   <button id="bload">빌지 불러오기</button>
+   <button id="bload">이 날짜 빌지</button>
+   <button id="btoday">매일 자동</button>
   </div>
-  <div class="st" id="bmsg">고른 날짜에 총공팀이 올린 [구역] 빌지를 찾아서 자동으로 넣어줘. 이후 1분마다 새 빌지도 자동으로 추가돼.</div>
+  <div class="st" id="bmsg">매일 자동: 날짜가 바뀌면 그날 빌지를 알아서 찾아서 바꿔줘 (기본값). 이 날짜 빌지: 고른 날짜로 고정.</div>
   <h2 style="margin-top:16px">또는 직접 링크 입력 (최대 5개)</h2>
   <div id="rows"></div>
   <div class="abtn">
@@ -516,8 +524,7 @@ async function saveSlots(slots,contain){
 }
 // 날짜 기본값 = 오늘(한국 시간)
 $('bd').value=new Date(Date.now()+9*3600e3).toISOString().slice(0,10);
-$('bload').onclick=async()=>{
-  const date=$('bd').value;
+async function loadBilji(date){
   $('bmsg').className='st'; $('bmsg').textContent='빌지 찾는 중...';
   let d=await post('/api/bilji',{key:adminKey,date});
   if(!d.ok && /비밀번호/.test(d.error||'')){
@@ -525,12 +532,15 @@ $('bload').onclick=async()=>{
     if(k){ adminKey=k; store.set('jul_admin',k); d=await post('/api/bilji',{key:adminKey,date}); }
   }
   if(!d.ok){ $('bmsg').className='st err'; $('bmsg').textContent='오류: '+d.error; return; }
-  $('bmsg').textContent = d.found
+  const when = date==='today' ? '매일 자동 모드 켰어. ' : '';
+  $('bmsg').textContent = when + (d.found
     ? `${d.found}개 구역 빌지를 불러왔어! 새 빌지가 올라오면 1분 안에 자동으로 추가돼.`
-    : '아직 그 날짜 빌지가 없어. 자동 확인은 켜뒀으니 올라오면 1분 안에 들어와.';
+    : '아직 빌지가 없어. 올라오면 1분 안에 자동으로 들어와.');
   store.set('jul_backup',JSON.stringify({slots:d.slots,contain:d.contain}));
   apply(d,true);
-};
+}
+$('bload').onclick=()=>loadBilji($('bd').value);
+$('btoday').onclick=()=>loadBilji('today');
 
 $('save').onclick=()=>{
   const slots=rows.map(r=>({name:r.querySelector('.an').value.trim(),url:r.querySelector('.au').value.trim()}));
@@ -611,9 +621,12 @@ function apply(d,force){
   const changed=force||d.version!==shared.version;
   shared={slots:d.slots||[],contain:!!d.contain,version:d.version,auto_date:d.auto_date||''};
   const ai=$('autoinfo');
-  if(shared.auto_date){
+  if(shared.auto_date==='today'){
+    ai.textContent='오늘 빌지 자동 연동 중 · 날짜가 바뀌고 새 빌지가 올라오면 자동으로 바뀌어';
+    ai.classList.remove('hide');
+  }else if(shared.auto_date){
     const [y,m,dd]=shared.auto_date.split('-');
-    ai.textContent=`${+m}월 ${+dd}일 빌지 자동 연동 중 · 새 빌지가 올라오면 자동으로 추가돼`;
+    ai.textContent=`${+m}월 ${+dd}일 빌지 고정 · 새 빌지가 올라오면 자동으로 추가돼`;
     ai.classList.remove('hide');
   }else ai.classList.add('hide');
   if(changed){ render(); fillAdmin(); loadCounts(); }
