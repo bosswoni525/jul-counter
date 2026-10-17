@@ -152,6 +152,8 @@ def fetch_comments(url, gal_id, post_no, gal_type):
 def clean(text):
     """HTML 태그, 공백, 기호 제거"""
     text = re.sub(r"<[^>]*>", "", str(text or ""))
+    # 디시 앱에서 달면 붙는 "- dc App" 꼬리표 제거
+    text = re.sub(r"\s*-\s*dc\s*(official\s*)?app\s*$", "", text, flags=re.I)
     return re.sub(r"[^\w]", "", text).replace("_", "")
 
 
