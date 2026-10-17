@@ -2,7 +2,7 @@
 총공 구역별 인원 실시간 카운터 서버
 - 관리자가 디시 게시글 최대 5개를 등록하면 서버에 저장됨
 - 누구든 사이트에 들어오면 등록된 구역별 '줄' 인원을 실시간으로 봄
-- 수정은 누구나 가능 (ADMIN_KEY 환경변수를 넣으면 비밀번호 필요)
+- 수정은 관리자 비밀번호(ADMIN_KEY 환경변수)를 아는 사람만 가능
 """
 import os
 import re
@@ -16,7 +16,7 @@ from flask import Flask, jsonify, request
 
 # ===== 설정 =====
 KEYWORD = os.environ.get("KEYWORD", "줄")
-ADMIN_KEY = os.environ.get("ADMIN_KEY", "")  # 비워두면 비밀번호 없이 누구나 수정 가능
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "")  # Render 환경변수에 관리자 비밀번호 설정 (비우면 비밀번호 없음)
 CACHE_SEC = 5      # 같은 글은 5초 동안 저장된 결과 재사용 (디시 요청 줄이기)
 MAX_CACHE = 50     # 동시에 기억할 게시글 수
 MAX_SLOTS = 5      # 최대 구역 수
@@ -257,7 +257,9 @@ def login():
     body = request.get_json(silent=True) or {}
     if not ADMIN_KEY:
         return jsonify(ok=True, open=True)  # 비밀번호 없이 누구나 수정 가능
-    return jsonify(ok=body.get("key") == ADMIN_KEY)
+    if body.get("key") == ADMIN_KEY:
+        return jsonify(ok=True)
+    return jsonify(ok=False, error="관리자 비밀번호가 틀렸어")
 
 
 PAGE = """<!doctype html>
@@ -294,6 +296,19 @@ PAGE = """<!doctype html>
  .abtn button.gray{background:#e3e5f0;color:#444}
  .hide{display:none}
  @media (max-width:480px){.arow{grid-template-columns:1fr}}
+ /* 폰: 카드를 작게 2열로 → 5개가 한 화면에 */
+ @media (max-width:600px){
+  .wrap{padding:12px 10px}
+  h1{font-size:17px}
+  .top{margin:6px 0 10px}
+  .sum{padding:6px 14px;font-size:13px} .sum b{font-size:20px}
+  .grid{grid-template-columns:1fr 1fr;gap:8px}
+  .card{padding:10px 12px;border-radius:10px}
+  .zone{font-size:14px}
+  .num{font-size:30px;margin:2px 0 0}
+  .st{font-size:10px;margin-top:2px}
+  details,a{font-size:11px} details{margin-top:2px}
+ }
 </style></head><body><div class="wrap">
  <h1>총공 구역별 인원 실시간 카운터</h1>
 
@@ -378,7 +393,18 @@ function setMode(admin){
   $('adminbtn').parentElement.classList.toggle('hide',admin);
   if(admin){ fillAdmin(); window.scrollTo(0,0); }
 }
-$('adminbtn').onclick=()=>setMode(true);
+$('adminbtn').onclick=async()=>{
+  // 서버에 비밀번호가 없거나, 이 기기에 저장된 비밀번호가 맞으면 바로 열림
+  let d=await post('/api/login',{key:adminKey});
+  if(!d.ok){
+    const k=prompt('관리자 비밀번호');
+    if(!k) return;
+    d=await post('/api/login',{key:k});
+    if(!d.ok){ alert(d.error||'비밀번호가 틀렸어'); return; }
+    adminKey=k; store.set('jul_admin',k);
+  }
+  setMode(true);
+};
 $('viewmode').onclick=()=>setMode(false);
 
 $('restore').onclick=()=>{
