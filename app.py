@@ -297,20 +297,22 @@ PAGE = """<!doctype html>
 </style></head><body><div class="wrap">
  <h1>총공 구역별 인원 실시간 카운터</h1>
 
- <div class="admin" id="admin">
-  <h2>게시글 링크 입력 (최대 5개) · 저장하면 모든 사람 화면에 반영돼</h2>
+ <div class="admin hide" id="admin">
+  <h2>관리자 모드 · 게시글 링크 입력 (최대 5개) · 저장하면 모든 사람 화면에 반영돼</h2>
   <div id="rows"></div>
   <div class="abtn">
    <label><input type="checkbox" id="c"> '__KW__' 포함된 댓글도 인정</label>
    <button id="save">저장</button>
    <button class="gray hide" id="restore">이전 설정 불러오기</button>
+   <button class="gray" id="viewmode">보기 모드로 돌아가기</button>
    <span id="amsg" class="st"></span>
   </div>
  </div>
 
  <div class="top"><div class="sum">전체 합계 <b id="total">0</b>명</div></div>
  <div class="grid" id="grid"></div>
- <div class="empty hide" id="empty">위 칸에 게시글 링크를 넣고 저장을 눌러줘.</div>
+ <div class="empty hide" id="empty">아직 등록된 구역이 없어. 아래 관리자 버튼을 눌러 링크를 넣어줘.</div>
+ <div class="foot"><button id="adminbtn">관리자</button></div>
 </div>
 <script>
 const MAX=5;
@@ -370,6 +372,15 @@ $('save').onclick=()=>{
   const slots=rows.map(r=>({name:r.querySelector('.an').value.trim(),url:r.querySelector('.au').value.trim()}));
   saveSlots(slots,$('c').checked);
 };
+// 관리자 모드 ↔ 보기 모드 전환 (비밀번호 없음)
+function setMode(admin){
+  $('admin').classList.toggle('hide',!admin);
+  $('adminbtn').parentElement.classList.toggle('hide',admin);
+  if(admin){ fillAdmin(); window.scrollTo(0,0); }
+}
+$('adminbtn').onclick=()=>setMode(true);
+$('viewmode').onclick=()=>setMode(false);
+
 $('restore').onclick=()=>{
   try{ const b=JSON.parse(store.get('jul_backup')); saveSlots(b.slots||[],!!b.contain); }catch(e){}
 };
