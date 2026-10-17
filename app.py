@@ -203,7 +203,7 @@ def get_comments_cached(url, gal_id, post_no, gal_type):
 
 @app.route("/api/count")
 def api_count():
-    contain = request.args.get("contain") == "1"
+    contain = True  # 키워드가 들어간 댓글은 무조건 셈 (예: "신청합니다", "저 신청이요")
     try:
         url, gal_id, post_no, gal_type = normalize_url(request.args.get("url"))
     except (ValueError, KeyError) as e:
@@ -316,7 +316,7 @@ PAGE = """<!doctype html>
   <h2>관리자 모드 · 게시글 링크 입력 (최대 5개) · 저장하면 모든 사람 화면에 반영돼</h2>
   <div id="rows"></div>
   <div class="abtn">
-   <label><input type="checkbox" id="c"> '__KW__' 포함된 댓글도 인정</label>
+   <input type="checkbox" id="c" class="hide" checked>
    <button id="save">저장</button>
    <button class="gray hide" id="restore">이전 설정 불러오기</button>
    <button class="gray" id="viewmode">보기 모드로 돌아가기</button>
