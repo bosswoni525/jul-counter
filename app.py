@@ -1,10 +1,12 @@
 """
-디시 게시물 '줄' 인원 실시간 중계 서버
-- 페이지에 게시글 링크를 붙이면 그 글에 '줄' 단 사람 수를 실시간으로 보여줌
-- 링크가 들어간 주소를 공유하면 다른 사람도 같은 화면을 볼 수 있음
+총공 구역별 인원 실시간 카운터 서버
+- 관리자가 디시 게시글 최대 5개를 등록하면 서버에 저장됨
+- 누구든 사이트에 들어오면 등록된 구역별 '줄' 인원을 실시간으로 봄
+- 수정은 관리자 비밀번호(ADMIN_KEY)를 아는 사람만 가능
 """
 import os
 import re
+import json
 import time
 import threading
 from urllib.parse import urlparse, parse_qs, urlencode
@@ -14,9 +16,37 @@ from flask import Flask, jsonify, request
 
 # ===== 설정 =====
 KEYWORD = os.environ.get("KEYWORD", "줄")
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "")  # Render 환경변수에 꼭 설정
 CACHE_SEC = 5      # 같은 글은 5초 동안 저장된 결과 재사용 (디시 요청 줄이기)
 MAX_CACHE = 50     # 동시에 기억할 게시글 수
+MAX_SLOTS = 5      # 최대 구역 수
+SLOTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "slots.json")
 # ================
+
+# 모두가 함께 보는 구역 설정 (서버에 저장)
+_shared = {"slots": [], "contain": False, "version": 0}
+_shared_lock = threading.Lock()
+
+
+def _load_shared():
+    try:
+        with open(SLOTS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        _shared.update(slots=data.get("slots", []), contain=bool(data.get("contain")),
+                       version=int(data.get("version", 0)))
+    except (OSError, ValueError):
+        pass
+
+
+def _save_shared():
+    try:
+        with open(SLOTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(_shared, f, ensure_ascii=False)
+    except OSError:
+        pass
+
+
+_load_shared()
 
 app = Flask(__name__)
 UA = (
@@ -125,12 +155,21 @@ def clean(text):
     return re.sub(r"[^\w]", "", text).replace("_", "")
 
 
+def is_real(c):
+    """광고(댓글돌이)와 삭제된 댓글이 아니면 True"""
+    if c.get("nicktype") == "COMMENT_BOY" or c.get("name") == "댓글돌이":
+        return False
+    if str(c.get("del_yn", "")).upper() == "Y" or "삭제된 댓글" in str(c.get("memo", "")):
+        return False
+    return True
+
+
 def count_people(comments, contain):
     """'줄' 단 사람 집계 (같은 사람은 1명으로)"""
     people = {}
     for c in comments:
-        if c.get("nicktype") == "COMMENT_BOY" or c.get("name") == "댓글돌이":
-            continue  # 광고 댓글 제외
+        if not is_real(c):
+            continue  # 광고·삭제 댓글 제외
         text = clean(c.get("memo"))
         hit = KEYWORD in text if contain else text == KEYWORD
         if not hit:
@@ -172,90 +211,253 @@ def api_count():
         people = count_people(entry["data"], contain)
         updated = time.strftime("%H:%M:%S", time.gmtime(entry["time"] + 9 * 3600))
         return jsonify(ok=True, url=url, count=len(people), people=people,
-                       total=len(entry["data"]), updated=updated)
+                       total=sum(1 for c in entry["data"] if is_real(c)), updated=updated)
     except Exception as e:
         return jsonify(ok=False, error=f"디시에서 댓글을 못 가져왔어 ({e})"), 502
+
+
+@app.route("/api/slots", methods=["GET"])
+def get_slots():
+    """지금 등록된 구역 목록 (누구나 볼 수 있음)"""
+    with _shared_lock:
+        return jsonify(ok=True, **_shared)
+
+
+@app.route("/api/slots", methods=["POST"])
+def set_slots():
+    """구역 목록 저장 (관리자 비밀번호 필요)"""
+    body = request.get_json(silent=True) or {}
+    if not ADMIN_KEY:
+        return jsonify(ok=False, error="서버에 ADMIN_KEY가 설정 안 돼 있어. Render 환경변수에 추가해줘"), 403
+    if body.get("key") != ADMIN_KEY:
+        return jsonify(ok=False, error="관리자 비밀번호가 틀렸어"), 403
+    slots = []
+    for s in (body.get("slots") or [])[:MAX_SLOTS]:
+        raw = str((s or {}).get("url", "")).strip()
+        name = str((s or {}).get("name", "")).strip()[:30]
+        if not raw:
+            slots.append({"url": "", "name": name})
+            continue
+        try:
+            url = normalize_url(raw)[0]
+        except (ValueError, KeyError) as e:
+            return jsonify(ok=False, error=f"{name or '구역'}: {e}"), 400
+        slots.append({"url": url, "name": name})
+    with _shared_lock:
+        _shared["slots"] = slots
+        _shared["contain"] = bool(body.get("contain"))
+        _shared["version"] += 1
+        _save_shared()
+        return jsonify(ok=True, **_shared)
+
+
+@app.route("/api/login", methods=["POST"])
+def login():
+    """관리자 비밀번호 확인만 함"""
+    body = request.get_json(silent=True) or {}
+    if not ADMIN_KEY:
+        return jsonify(ok=False, error="서버에 ADMIN_KEY가 설정 안 돼 있어. Render 환경변수에 추가해줘"), 403
+    return jsonify(ok=body.get("key") == ADMIN_KEY)
 
 
 PAGE = """<!doctype html>
 <html lang="ko"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>줄 카운터</title>
+<title>총공 구역별 인원 실시간 카운터</title>
 <style>
  *{box-sizing:border-box}
  body{margin:0;font-family:sans-serif;background:#f4f5fb;color:#222}
- .box{max-width:480px;margin:24px auto;background:#fff;border-radius:14px;padding:20px;box-shadow:0 4px 16px rgba(0,0,0,.08)}
- h1{font-size:18px;color:#3b4890;margin:0 0 12px}
- form{display:flex;gap:6px;margin-bottom:12px}
- input[type=text]{flex:1;min-width:0;padding:10px;border:1px solid #ccd;border-radius:8px;font-size:14px}
- button{padding:10px 14px;border:0;border-radius:8px;background:#3b4890;color:#fff;font-size:14px;cursor:pointer}
- .num{font-size:64px;font-weight:bold;margin:8px 0}
- .st{font-size:12px;color:#888;margin-top:6px}
+ .wrap{max-width:1100px;margin:0 auto;padding:20px 16px}
+ h1{font-size:22px;color:#3b4890;margin:0 0 6px;text-align:center}
+ .top{display:flex;justify-content:center;margin:10px 0 18px}
+ .sum{background:#3b4890;color:#fff;border-radius:10px;padding:8px 18px;font-size:15px}
+ .sum b{font-size:24px}
+ .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px}
+ .card{background:#fff;border-radius:14px;padding:16px;box-shadow:0 4px 16px rgba(0,0,0,.08)}
+ .zone{font-size:17px;font-weight:bold;color:#3b4890}
+ .num{font-size:52px;font-weight:bold;margin:4px 0 0}
+ .st{font-size:12px;color:#888;margin-top:4px}
  .err{color:#c33}
- ol{padding-left:22px} li{margin:4px 0} .t{color:#999;font-size:12px}
- a{color:#3b4890;font-size:13px}
- #share{font-size:12px;margin-left:6px}
+ .empty{text-align:center;color:#888;padding:40px 0}
+ details{margin-top:6px;font-size:13px} summary{cursor:pointer;color:#3b4890}
+ ol{padding-left:22px;margin:6px 0} li{margin:3px 0} .t{color:#999;font-size:11px}
+ a{color:#3b4890;font-size:12px}
+ .foot{text-align:center;margin-top:24px}
+ .foot button{background:none;border:0;color:#aaa;font-size:12px;cursor:pointer;text-decoration:underline}
+ /* 관리자 패널 */
+ .admin{background:#fff;border:2px solid #3b4890;border-radius:14px;padding:16px;margin-bottom:18px}
+ .admin h2{font-size:15px;margin:0 0 10px;color:#3b4890}
+ .arow{display:grid;grid-template-columns:110px 1fr;gap:6px;margin-bottom:6px}
+ .admin input[type=text]{width:100%;padding:9px;border:1px solid #ccd;border-radius:8px;font-size:14px}
+ .abtn{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:10px;font-size:13px}
+ .abtn button{padding:9px 14px;border:0;border-radius:8px;background:#3b4890;color:#fff;font-size:13px;cursor:pointer}
+ .abtn button.gray{background:#e3e5f0;color:#444}
  .hide{display:none}
-</style></head><body><div class="box">
- <h1>'__KW__' 인원 실시간 카운터</h1>
- <form id="f">
-  <input type="text" id="u" placeholder="디시 게시글 링크 붙여넣기">
-  <button>확인</button>
- </form>
- <div id="res" class="hide">
-  <a id="orig" target="_blank">원본 게시물 보기</a>
-  <a href="#" id="share">이 화면 링크 복사</a>
-  <div class="num" id="n">-</div>
-  <label><input type="checkbox" id="c"> '__KW__' 포함된 댓글도 인정</label>
-  <div class="st" id="s"></div>
-  <ol id="l"></ol>
+ @media (max-width:480px){.arow{grid-template-columns:1fr}}
+</style></head><body><div class="wrap">
+ <h1>총공 구역별 인원 실시간 카운터</h1>
+
+ <div class="admin hide" id="admin">
+  <h2>관리자 설정 (저장하면 모든 사람 화면에 바로 반영돼)</h2>
+  <div id="rows"></div>
+  <div class="abtn">
+   <label><input type="checkbox" id="c"> '__KW__' 포함된 댓글도 인정</label>
+   <button id="save">저장</button>
+   <button class="gray hide" id="restore">이전 설정 불러오기</button>
+   <button class="gray" id="logout">관리자 나가기</button>
+   <span id="amsg" class="st"></span>
+  </div>
  </div>
- <div class="st" id="msg">게시글 링크를 붙이고 확인을 누르면 5초마다 자동으로 갱신돼.</div>
+
+ <div class="top"><div class="sum">전체 합계 <b id="total">0</b>명</div></div>
+ <div class="grid" id="grid"></div>
+ <div class="empty hide" id="empty">아직 등록된 구역이 없어.</div>
+ <div class="foot"><button id="login">관리자</button></div>
 </div>
 <script>
+const MAX=5;
 const $=id=>document.getElementById(id);
-let target='', timer=null;
-
-function start(url){
-  target=url.trim();
-  if(!target) return;
-  $('u').value=target;
-  // 주소창에 링크 저장 → 이 주소를 공유하면 같은 글이 바로 뜸
-  history.replaceState(null,'','?url='+encodeURIComponent(target));
-  $('res').classList.remove('hide');
-  $('n').textContent='-'; $('l').innerHTML='';
-  $('s').textContent='불러오는 중... (서버가 자고 있었으면 최대 1분)';
-  $('msg').classList.add('hide');
-  clearInterval(timer); load(); timer=setInterval(load,5000);
-}
-
-async function load(){
-  if(!target) return;
-  try{
-    const c=$('c').checked?1:0;
-    const r=await fetch('/api/count?contain='+c+'&url='+encodeURIComponent(target));
-    const d=await r.json();
-    if(!d.ok) throw new Error(d.error);
-    $('orig').href=d.url;
-    $('n').textContent=d.count+'명';
-    $('s').className='st';
-    $('s').textContent='전체 댓글 '+d.total+'개 · 갱신 '+d.updated;
-    $('l').innerHTML=d.people.map(p=>
-      '<li>'+p.name.replace(/</g,'&lt;')+' <span class="t">'+p.time+'</span></li>').join('');
-  }catch(e){ $('s').className='st err'; $('s').textContent='오류: '+e.message; }
-}
-
-$('f').onsubmit=e=>{e.preventDefault(); start($('u').value);};
-$('c').onchange=load;
-$('share').onclick=e=>{
-  e.preventDefault();
-  navigator.clipboard.writeText(location.href).then(()=>{$('share').textContent='복사됨!';
-    setTimeout(()=>$('share').textContent='이 화면 링크 복사',1500);});
+const esc=s=>String(s??'').replace(/[&<>"]/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[ch]));
+const store={
+  get:k=>{try{return localStorage.getItem(k);}catch(e){return null;}},
+  set:(k,v)=>{try{localStorage.setItem(k,v);}catch(e){}},
+  del:k=>{try{localStorage.removeItem(k);}catch(e){}},
 };
-// 주소에 ?url= 이 있으면 바로 시작
-const init=new URLSearchParams(location.search).get('url');
-if(init) start(init);
-</script></body></html>"""
+
+let shared={slots:[],contain:false,version:-1};
+let adminKey=store.get('jul_admin')||'';
+const counts={};   // url -> 결과
+
+// ===== 관리자 입력칸 5줄 만들기 =====
+for(let i=0;i<MAX;i++){
+  const r=document.createElement('div');
+  r.className='arow';
+  r.innerHTML=`<input type="text" class="an" placeholder="구역 ${i+1} 이름"><input type="text" class="au" placeholder="디시 게시글 링크">`;
+  $('rows').appendChild(r);
+}
+const rows=[...$('rows').children];
+
+function fillAdmin(){
+  rows.forEach((r,i)=>{
+    const s=shared.slots[i]||{};
+    r.querySelector('.an').value=s.name||'';
+    r.querySelector('.au').value=s.url||'';
+  });
+  $('c').checked=!!shared.contain;
+  const backup=store.get('jul_backup');
+  $('restore').classList.toggle('hide',!(backup && !shared.slots.some(s=>s.url)));
+}
+
+function showAdmin(on){
+  $('admin').classList.toggle('hide',!on);
+  $('login').classList.toggle('hide',on);
+  if(on) fillAdmin();
+}
+
+async function post(path,body){
+  const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  return r.json();
+}
+
+$('login').onclick=async()=>{
+  const k=prompt('관리자 비밀번호');
+  if(!k) return;
+  const d=await post('/api/login',{key:k});
+  if(d.ok){ adminKey=k; store.set('jul_admin',k); showAdmin(true); }
+  else alert(d.error||'비밀번호가 틀렸어');
+};
+$('logout').onclick=()=>{ adminKey=''; store.del('jul_admin'); showAdmin(false); };
+
+async function saveSlots(slots,contain){
+  $('amsg').className='st'; $('amsg').textContent='저장 중...';
+  const d=await post('/api/slots',{key:adminKey,slots,contain});
+  if(!d.ok){ $('amsg').className='st err'; $('amsg').textContent='오류: '+d.error; return; }
+  store.set('jul_backup',JSON.stringify({slots:d.slots,contain:d.contain}));
+  $('amsg').textContent='저장됨! 모든 사람 화면에 반영돼';
+  setTimeout(()=>$('amsg').textContent='',2500);
+  apply(d,true);
+}
+$('save').onclick=()=>{
+  const slots=rows.map(r=>({name:r.querySelector('.an').value.trim(),url:r.querySelector('.au').value.trim()}));
+  saveSlots(slots,$('c').checked);
+};
+$('restore').onclick=()=>{
+  try{ const b=JSON.parse(store.get('jul_backup')); saveSlots(b.slots||[],!!b.contain); }catch(e){}
+};
+
+// ===== 보는 화면 =====
+function render(){
+  const list=shared.slots.map((s,i)=>({...s,i})).filter(s=>s.url);
+  $('empty').classList.toggle('hide',list.length>0);
+  $('grid').innerHTML=list.map(s=>`
+    <div class="card" data-url="${esc(s.url)}">
+      <div class="zone">${esc(s.name||('구역 '+(s.i+1)))}</div>
+      <div class="num">-</div>
+      <div class="st">불러오는 중... (서버가 자고 있었으면 최대 1분)</div>
+      <a href="${esc(s.url)}" target="_blank">원본 게시물 보기</a>
+      <details><summary>명단 보기</summary><ol></ol></details>
+    </div>`).join('');
+  list.forEach(s=>{ if(counts[s.url]) paint(s.url); });
+  sum();
+}
+
+function paint(url){
+  const card=[...$('grid').children].find(c=>c.dataset.url===url);
+  const d=counts[url];
+  if(!card||!d) return;
+  const st=card.querySelector('.st');
+  if(d.ok){
+    card.querySelector('.num').textContent=d.count+'명';
+    st.className='st';
+    st.textContent='전체 댓글 '+d.total+'개 · 갱신 '+d.updated;
+    card.querySelector('ol').innerHTML=d.people.map(p=>'<li>'+esc(p.name)+' <span class="t">'+esc(p.time)+'</span></li>').join('');
+  }else{
+    st.className='st err';
+    st.textContent='오류: '+d.error;
+  }
+}
+
+function sum(){
+  $('total').textContent=shared.slots.reduce((a,s)=>a+((s.url&&counts[s.url]&&counts[s.url].ok)?counts[s.url].count:0),0);
+}
+
+function apply(d,force){
+  const changed=force||d.version!==shared.version;
+  shared={slots:d.slots||[],contain:!!d.contain,version:d.version};
+  if(changed){ render(); if(adminKey) fillAdmin(); loadCounts(); }
+}
+
+async function loadCounts(){
+  const urls=[...new Set(shared.slots.map(s=>s.url).filter(Boolean))];
+  await Promise.all(urls.map(async url=>{
+    try{
+      const r=await fetch('/api/count?contain='+(shared.contain?1:0)+'&url='+encodeURIComponent(url));
+      counts[url]=await r.json();
+    }catch(e){ counts[url]={ok:false,error:e.message}; }
+    paint(url);
+  }));
+  sum();
+}
+
+async function tick(){
+  try{
+    const r=await fetch('/api/slots');
+    const d=await r.json();
+    if(d.ok){
+      const changed=d.version!==shared.version;
+      apply(d,false);
+      if(!changed) loadCounts();
+    }
+  }catch(e){}
+}
+
+if(adminKey){
+  post('/api/login',{key:adminKey}).then(d=>{ if(d.ok) showAdmin(true); else { adminKey=''; store.del('jul_admin'); } });
+}
+tick();
+setInterval(tick,5000);
+</script></body></html>
+"""
 
 
 @app.route("/")
