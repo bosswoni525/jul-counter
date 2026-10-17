@@ -1,12 +1,14 @@
 """
 총공 구역별 인원 실시간 카운터 서버
 - 관리자가 디시 게시글 최대 5개를 등록하면 서버에 저장됨
+- 날짜를 고르면 그날 빌지([P] [U] 등)를 갤러리에서 찾아 자동 등록하고, 1분마다 새 빌지 확인
 - 누구든 사이트에 들어오면 등록된 구역별 '줄' 인원을 실시간으로 봄
 - 수정은 관리자 비밀번호(ADMIN_KEY 환경변수)를 아는 사람만 가능
 """
 import os
 import re
 import json
+import html as htmllib
 import time
 import threading
 from urllib.parse import urlparse, parse_qs, urlencode
@@ -21,10 +23,17 @@ CACHE_SEC = 5      # 같은 글은 5초 동안 저장된 결과 재사용 (디�
 MAX_CACHE = 50     # 동시에 기억할 게시글 수
 MAX_SLOTS = 5      # 최대 구역 수
 SLOTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "slots.json")
+
+# 빌지 자동 불러오기 설정
+BILJI_GALLERY = os.environ.get("BILJI_GALLERY", "rsbakery")      # 빌지가 올라오는 미니 갤러리 id
+BILJI_UIDS = [u.strip() for u in os.environ.get("BILJI_UIDS", "highway1690").split(",") if u.strip()]
+BILJI_SKIP_TAGS = {"총공", "공지", "필독", "안내"}                   # 빌지가 아닌 말머리
+BILJI_RECHECK_SEC = 60                                            # 자동 모드에서 새 빌지 확인 간격
 # ================
 
 # 모두가 함께 보는 구역 설정 (서버에 저장)
-_shared = {"slots": [], "contain": False, "version": 0}
+_shared = {"slots": [], "contain": False, "version": 0, "auto_date": ""}
+_bilji_state = {"last": 0, "running": False}
 _shared_lock = threading.Lock()
 
 
@@ -33,7 +42,7 @@ def _load_shared():
         with open(SLOTS_FILE, encoding="utf-8") as f:
             data = json.load(f)
         _shared.update(slots=data.get("slots", []), contain=bool(data.get("contain")),
-                       version=int(data.get("version", 0)))
+                       version=int(data.get("version", 0)), auto_date=data.get("auto_date", ""))
     except (OSError, ValueError):
         pass
 
@@ -221,6 +230,7 @@ def api_count():
 @app.route("/api/slots", methods=["GET"])
 def get_slots():
     """지금 등록된 구역 목록 (누구나 볼 수 있음)"""
+    maybe_recheck_bilji()
     with _shared_lock:
         return jsonify(ok=True, **_shared)
 
@@ -246,9 +256,120 @@ def set_slots():
     with _shared_lock:
         _shared["slots"] = slots
         _shared["contain"] = bool(body.get("contain"))
+        _shared["auto_date"] = ""  # 직접 저장하면 빌지 자동 모드는 꺼짐
         _shared["version"] += 1
         _save_shared()
         return jsonify(ok=True, **_shared)
+
+
+# ===== 빌지 자동 불러오기 =====
+def kst_today():
+    return time.strftime("%Y-%m-%d", time.gmtime(time.time() + 9 * 3600))
+
+
+def zone_name(tag):
+    """[P] → [P]구역, [1구역] → 1구역"""
+    return tag if "구역" in tag else f"[{tag}]구역"
+
+
+def fetch_bilji(date):
+    """갤러리 목록에서 date(YYYY-MM-DD)에 빌지 계정이 올린 [구역] 글 찾기"""
+    s = requests.Session()
+    s.headers.update({"User-Agent": UA})
+    found = {}
+    for page in range(1, 6):
+        url = f"https://gall.dcinside.com/mini/board/lists/?id={BILJI_GALLERY}&page={page}"
+        page_html = s.get(url, timeout=10, headers={"Referer": url}).text
+        rows = re.findall(r'<tr class="ub-content[^"]*" data-no="(\d+)"(.*?)</tr>', page_html, re.S)
+        if not rows:
+            break
+        older = False
+        for no, body in rows:
+            d = re.search(r'class="gall_date" title="([^"]+)"', body)
+            uid = re.search(r'data-uid="([^"]*)"', body)
+            t = re.search(r'class="gall_tit[^"]*">.*?<a [^>]*>(.*?)</a>', body, re.S)
+            if not (d and uid and t):
+                continue
+            post_date = d.group(1)[:10]
+            if post_date < date:
+                older = True
+                continue
+            if post_date != date or uid.group(1) not in BILJI_UIDS:
+                continue
+            title = htmllib.unescape(re.sub(r"<[^>]*>", "", t.group(1))).strip()
+            m = re.match(r"\[([^\]]+)\]", title)
+            if not m or m.group(1).strip() in BILJI_SKIP_TAGS:
+                continue
+            tag = m.group(1).strip()
+            # 같은 구역 빌지가 여러 개면 가장 최신 글
+            if tag not in found or int(no) > int(found[tag]["no"]):
+                found[tag] = {"no": no, "tag": tag, "title": title}
+        if older:
+            break
+    items = sorted(found.values(), key=lambda x: int(x["no"]))[:MAX_SLOTS]
+    return [{
+        "name": zone_name(x["tag"]),
+        "url": f"https://gall.dcinside.com/mini/board/view/?id={BILJI_GALLERY}&no={x['no']}",
+        "title": x["title"],
+    } for x in items]
+
+
+def apply_bilji(date, slots):
+    """찾은 빌지를 구역 목록에 반영 (바뀐 게 있을 때만)"""
+    with _shared_lock:
+        if _shared.get("auto_date") != date:
+            return  # 그사이 관리자가 다른 설정으로 바꿨으면 무시
+        old = [(x.get("name"), x.get("url")) for x in _shared["slots"] if x.get("url")]
+        new = [(x["name"], x["url"]) for x in slots]
+        if old != new:
+            _shared["slots"] = slots
+            _shared["version"] += 1
+            _save_shared()
+
+
+def maybe_recheck_bilji():
+    """자동 모드면 1분마다 새 빌지가 올라왔는지 확인 (뒤에서 몰래 실행)"""
+    date = _shared.get("auto_date")
+    if not date or _bilji_state["running"] or time.time() - _bilji_state["last"] < BILJI_RECHECK_SEC:
+        return
+    _bilji_state["running"] = True
+    _bilji_state["last"] = time.time()
+
+    def run():
+        try:
+            slots = fetch_bilji(date)
+            if slots:
+                apply_bilji(date, slots)
+        except Exception:
+            pass
+        finally:
+            _bilji_state["running"] = False
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+@app.route("/api/bilji", methods=["POST"])
+def load_bilji():
+    """선택한 날짜의 빌지를 찾아서 구역에 넣고, 이후 자동으로 새 빌지 확인"""
+    body = request.get_json(silent=True) or {}
+    if ADMIN_KEY and body.get("key") != ADMIN_KEY:
+        return jsonify(ok=False, error="관리자 비밀번호가 틀렸어"), 403
+    date = str(body.get("date") or kst_today())
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+        return jsonify(ok=False, error="날짜 형식이 이상해"), 400
+    try:
+        slots = fetch_bilji(date)
+    except Exception as e:
+        return jsonify(ok=False, error=f"디시 목록을 못 가져왔어 ({e})"), 502
+    with _shared_lock:
+        _shared["auto_date"] = date
+        if slots:
+            _shared["slots"] = slots
+        _shared["version"] += 1
+        _save_shared()
+    _bilji_state["last"] = time.time()
+    with _shared_lock:
+        return jsonify(ok=True, found=len(slots), **_shared)
 
 
 @app.route("/api/login", methods=["POST"])
@@ -295,6 +416,9 @@ PAGE = """<!doctype html>
  .abtn button{padding:9px 14px;border:0;border-radius:8px;background:#3b4890;color:#fff;font-size:13px;cursor:pointer}
  .abtn button.gray{background:#e3e5f0;color:#444}
  .hide{display:none}
+ .bili{display:flex;gap:6px;margin-bottom:4px}
+ .bili input{flex:1;min-width:0;padding:9px;border:1px solid #ccd;border-radius:8px;font-size:14px}
+ .bili button{padding:9px 14px;border:0;border-radius:8px;background:#3b4890;color:#fff;font-size:13px;cursor:pointer;white-space:nowrap}
  @media (max-width:480px){.arow{grid-template-columns:1fr}}
  /* 폰: 카드를 작게 2열로 → 5개가 한 화면에 */
  @media (max-width:600px){
@@ -311,9 +435,16 @@ PAGE = """<!doctype html>
  }
 </style></head><body><div class="wrap">
  <h1>총공 구역별 인원 실시간 카운터</h1>
+ <div class="st hide" id="autoinfo" style="text-align:center"></div>
 
  <div class="admin hide" id="admin">
-  <h2>관리자 모드 · 게시글 링크 입력 (최대 5개) · 저장하면 모든 사람 화면에 반영돼</h2>
+  <h2>📅 날짜로 빌지 불러오기</h2>
+  <div class="bili">
+   <input type="date" id="bd">
+   <button id="bload">빌지 불러오기</button>
+  </div>
+  <div class="st" id="bmsg">고른 날짜에 총공팀이 올린 [구역] 빌지를 찾아서 자동으로 넣어줘. 이후 1분마다 새 빌지도 자동으로 추가돼.</div>
+  <h2 style="margin-top:16px">또는 직접 링크 입력 (최대 5개)</h2>
   <div id="rows"></div>
   <div class="abtn">
    <input type="checkbox" id="c" class="hide" checked>
@@ -383,6 +514,24 @@ async function saveSlots(slots,contain){
   setTimeout(()=>$('amsg').textContent='',2500);
   apply(d,true);
 }
+// 날짜 기본값 = 오늘(한국 시간)
+$('bd').value=new Date(Date.now()+9*3600e3).toISOString().slice(0,10);
+$('bload').onclick=async()=>{
+  const date=$('bd').value;
+  $('bmsg').className='st'; $('bmsg').textContent='빌지 찾는 중...';
+  let d=await post('/api/bilji',{key:adminKey,date});
+  if(!d.ok && /비밀번호/.test(d.error||'')){
+    const k=prompt('관리자 비밀번호');
+    if(k){ adminKey=k; store.set('jul_admin',k); d=await post('/api/bilji',{key:adminKey,date}); }
+  }
+  if(!d.ok){ $('bmsg').className='st err'; $('bmsg').textContent='오류: '+d.error; return; }
+  $('bmsg').textContent = d.found
+    ? `${d.found}개 구역 빌지를 불러왔어! 새 빌지가 올라오면 1분 안에 자동으로 추가돼.`
+    : '아직 그 날짜 빌지가 없어. 자동 확인은 켜뒀으니 올라오면 1분 안에 들어와.';
+  store.set('jul_backup',JSON.stringify({slots:d.slots,contain:d.contain}));
+  apply(d,true);
+};
+
 $('save').onclick=()=>{
   const slots=rows.map(r=>({name:r.querySelector('.an').value.trim(),url:r.querySelector('.au').value.trim()}));
   saveSlots(slots,$('c').checked);
@@ -460,7 +609,13 @@ function sum(){
 
 function apply(d,force){
   const changed=force||d.version!==shared.version;
-  shared={slots:d.slots||[],contain:!!d.contain,version:d.version};
+  shared={slots:d.slots||[],contain:!!d.contain,version:d.version,auto_date:d.auto_date||''};
+  const ai=$('autoinfo');
+  if(shared.auto_date){
+    const [y,m,dd]=shared.auto_date.split('-');
+    ai.textContent=`${+m}월 ${+dd}일 빌지 자동 연동 중 · 새 빌지가 올라오면 자동으로 추가돼`;
+    ai.classList.remove('hide');
+  }else ai.classList.add('hide');
   if(changed){ render(); fillAdmin(); loadCounts(); }
 }
 
