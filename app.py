@@ -2,7 +2,7 @@
 총공 구역별 인원 실시간 카운터 서버
 - 관리자가 디시 게시글 최대 5개를 등록하면 서버에 저장됨
 - 누구든 사이트에 들어오면 등록된 구역별 '줄' 인원을 실시간으로 봄
-- 수정은 관리자 비밀번호(ADMIN_KEY)를 아는 사람만 가능
+- 수정은 누구나 가능 (ADMIN_KEY 환경변수를 넣으면 비밀번호 필요)
 """
 import os
 import re
@@ -16,7 +16,7 @@ from flask import Flask, jsonify, request
 
 # ===== 설정 =====
 KEYWORD = os.environ.get("KEYWORD", "줄")
-ADMIN_KEY = os.environ.get("ADMIN_KEY", "")  # Render 환경변수에 꼭 설정
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "")  # 비워두면 비밀번호 없이 누구나 수정 가능
 CACHE_SEC = 5      # 같은 글은 5초 동안 저장된 결과 재사용 (디시 요청 줄이기)
 MAX_CACHE = 50     # 동시에 기억할 게시글 수
 MAX_SLOTS = 5      # 최대 구역 수
@@ -227,9 +227,7 @@ def get_slots():
 def set_slots():
     """구역 목록 저장 (관리자 비밀번호 필요)"""
     body = request.get_json(silent=True) or {}
-    if not ADMIN_KEY:
-        return jsonify(ok=False, error="서버에 ADMIN_KEY가 설정 안 돼 있어. Render 환경변수에 추가해줘"), 403
-    if body.get("key") != ADMIN_KEY:
+    if ADMIN_KEY and body.get("key") != ADMIN_KEY:
         return jsonify(ok=False, error="관리자 비밀번호가 틀렸어"), 403
     slots = []
     for s in (body.get("slots") or [])[:MAX_SLOTS]:
@@ -256,7 +254,7 @@ def login():
     """관리자 비밀번호 확인만 함"""
     body = request.get_json(silent=True) or {}
     if not ADMIN_KEY:
-        return jsonify(ok=False, error="서버에 ADMIN_KEY가 설정 안 돼 있어. Render 환경변수에 추가해줘"), 403
+        return jsonify(ok=True, open=True)  # 비밀번호 없이 누구나 수정 가능
     return jsonify(ok=body.get("key") == ADMIN_KEY)
 
 
@@ -297,22 +295,20 @@ PAGE = """<!doctype html>
 </style></head><body><div class="wrap">
  <h1>총공 구역별 인원 실시간 카운터</h1>
 
- <div class="admin hide" id="admin">
-  <h2>관리자 설정 (저장하면 모든 사람 화면에 바로 반영돼)</h2>
+ <div class="admin" id="admin">
+  <h2>게시글 링크 입력 (최대 5개) · 저장하면 모든 사람 화면에 반영돼</h2>
   <div id="rows"></div>
   <div class="abtn">
    <label><input type="checkbox" id="c"> '__KW__' 포함된 댓글도 인정</label>
    <button id="save">저장</button>
    <button class="gray hide" id="restore">이전 설정 불러오기</button>
-   <button class="gray" id="logout">관리자 나가기</button>
    <span id="amsg" class="st"></span>
   </div>
  </div>
 
  <div class="top"><div class="sum">전체 합계 <b id="total">0</b>명</div></div>
  <div class="grid" id="grid"></div>
- <div class="empty hide" id="empty">아직 등록된 구역이 없어.</div>
- <div class="foot"><button id="login">관리자</button></div>
+ <div class="empty hide" id="empty">위 칸에 게시글 링크를 넣고 저장을 눌러줘.</div>
 </div>
 <script>
 const MAX=5;
@@ -348,29 +344,20 @@ function fillAdmin(){
   $('restore').classList.toggle('hide',!(backup && !shared.slots.some(s=>s.url)));
 }
 
-function showAdmin(on){
-  $('admin').classList.toggle('hide',!on);
-  $('login').classList.toggle('hide',on);
-  if(on) fillAdmin();
-}
 
 async function post(path,body){
   const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   return r.json();
 }
 
-$('login').onclick=async()=>{
-  const k=prompt('관리자 비밀번호');
-  if(!k) return;
-  const d=await post('/api/login',{key:k});
-  if(d.ok){ adminKey=k; store.set('jul_admin',k); showAdmin(true); }
-  else alert(d.error||'비밀번호가 틀렸어');
-};
-$('logout').onclick=()=>{ adminKey=''; store.del('jul_admin'); showAdmin(false); };
 
 async function saveSlots(slots,contain){
   $('amsg').className='st'; $('amsg').textContent='저장 중...';
-  const d=await post('/api/slots',{key:adminKey,slots,contain});
+  let d=await post('/api/slots',{key:adminKey,slots,contain});
+  if(!d.ok && /비밀번호/.test(d.error||'')){
+    const k=prompt('비밀번호');
+    if(k){ adminKey=k; store.set('jul_admin',k); d=await post('/api/slots',{key:adminKey,slots,contain}); }
+  }
   if(!d.ok){ $('amsg').className='st err'; $('amsg').textContent='오류: '+d.error; return; }
   store.set('jul_backup',JSON.stringify({slots:d.slots,contain:d.contain}));
   $('amsg').textContent='저장됨! 모든 사람 화면에 반영돼';
@@ -424,7 +411,7 @@ function sum(){
 function apply(d,force){
   const changed=force||d.version!==shared.version;
   shared={slots:d.slots||[],contain:!!d.contain,version:d.version};
-  if(changed){ render(); if(adminKey) fillAdmin(); loadCounts(); }
+  if(changed){ render(); fillAdmin(); loadCounts(); }
 }
 
 async function loadCounts(){
@@ -451,9 +438,6 @@ async function tick(){
   }catch(e){}
 }
 
-if(adminKey){
-  post('/api/login',{key:adminKey}).then(d=>{ if(d.ok) showAdmin(true); else { adminKey=''; store.del('jul_admin'); } });
-}
 tick();
 setInterval(tick,5000);
 </script></body></html>
