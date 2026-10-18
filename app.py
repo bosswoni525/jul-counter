@@ -8,6 +8,7 @@
 import os
 import re
 import json
+import unicodedata
 import html as htmllib
 import time
 import threading
@@ -28,8 +29,10 @@ SLOTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "slots.jso
 
 # 빌지 자동 불러오기 설정
 BILJI_GALLERY = os.environ.get("BILJI_GALLERY", "rsbakery")      # 빌지가 올라오는 미니 갤러리 id
-BILJI_UIDS = [u.strip() for u in os.environ.get("BILJI_UIDS", "highway1690").split(",") if u.strip()]
-BILJI_SKIP_TAGS = {"총공", "공지", "필독", "안내"}                   # 빌지가 아닌 말머리
+# 빌지 올리는 계정 아이디 (highway1690 = 리센느음원총공팀, church4099 = Re:mine)
+BILJI_UIDS = [u.strip() for u in os.environ.get("BILJI_UIDS", "highway1690,church4099").split(",") if u.strip()]
+BILJI_SKIP_TAGS = {"총공", "공지", "필독", "안내"}
+ZONE_ORDER = os.environ.get("ZONE_ORDER", "P,U,L,S,E").split(",")  # 카드 표시 순서                   # 빌지가 아닌 말머리
 BILJI_RECHECK_SEC = 60                                            # 자동 모드에서 새 빌지 확인 간격
 # ================
 
@@ -324,13 +327,17 @@ def fetch_bilji(date):
             m = re.match(r"\[([^\]]+)\]", title)
             if not m or m.group(1).strip() in BILJI_SKIP_TAGS:
                 continue
-            tag = m.group(1).strip()
+            # [𝑷] 같은 특수 글꼴 알파벳을 [P]로 통일
+            tag = unicodedata.normalize("NFKC", m.group(1)).strip().upper()
             # 같은 구역 빌지가 여러 개면 가장 최신 글
             if tag not in found or int(no) > int(found[tag]["no"]):
                 found[tag] = {"no": no, "tag": tag, "title": title}
         if older:
             break
-    items = sorted(found.values(), key=lambda x: int(x["no"]))[:MAX_SLOTS]
+    def order(x):
+        t = x["tag"]
+        return (ZONE_ORDER.index(t) if t in ZONE_ORDER else len(ZONE_ORDER), int(x["no"]))
+    items = sorted(found.values(), key=order)[:MAX_SLOTS]
     return [{
         "name": zone_name(x["tag"]),
         "url": f"https://gall.dcinside.com/mini/board/view/?id={BILJI_GALLERY}&no={x['no']}",
