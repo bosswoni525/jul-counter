@@ -182,7 +182,10 @@ def is_real(c):
 
 
 # 키워드별 추가 인정 패턴 (예: "총공완", "지각완"처럼 '완'으로 끝나면 완료로 인정)
-KEYWORD_ALIASES = {"완료": [re.compile(r"완$")]}
+KEYWORD_ALIASES = {
+    "신청": [re.compile(r"참여")],   # "참여합니다"도 신청 인원으로 셈
+    "완료": [re.compile(r"완$")],    # "총공완", "지각완"도 완료로 셈
+}
 
 
 def matches(text, k, contain):
