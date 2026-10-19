@@ -211,7 +211,7 @@ def count_people(comments, contain, keywords=None):
             name = c.get("name") or "?"
             if not uid and c.get("ip"):
                 name += f" ({c.get('ip')})"
-            people[key] = {"name": name, "time": c.get("reg_date", "")}
+            people[key] = {"name": name, "time": c.get("reg_date", ""), "key": key}
     return list(people.values())
 
 
@@ -502,6 +502,7 @@ PAGE = """<!doctype html>
  </div>
 
  <div class="top"><div class="sum" id="total">전체 합계 <b>0</b>명</div></div>
+ <div class="st" id="rawsum" style="text-align:center;margin:-10px 0 14px"></div>
  <div class="grid" id="grid"></div>
  <div class="empty hide" id="empty">아직 등록된 구역이 없어. 아래 관리자 버튼을 눌러 링크를 넣어줘.</div>
  <div class="foot"><button id="adminbtn">관리자</button></div>
@@ -704,14 +705,24 @@ function paint(url){
 }
 
 function sum(){
-  const tot=KWS.map(()=>0);
+  // 여러 구역에 신청한 사람은 1명으로 (중복 제외)
+  const uniq=KWS.map(()=>new Set()), raw=KWS.map(()=>0);
+  const seen=new Set();
   shared.slots.forEach(s=>{
-    const d=s.url&&counts[s.url];
-    if(d&&d.ok) (d.groups||[{count:d.count}]).forEach((g,j)=>{ tot[j]+=g.count; });
+    if(!s.url || seen.has(s.url)) return; seen.add(s.url);
+    const d=counts[s.url];
+    if(d&&d.ok) (d.groups||[{count:d.count,people:d.people}]).forEach((g,j)=>{
+      raw[j]+=g.count;
+      (g.people||[]).forEach(p=>uniq[j].add(p.key||p.name));
+    });
   });
   $('total').innerHTML = KWS.length>1
-    ? KWS.map((k,j)=>`${esc(k)} 합계 <b>${tot[j]}</b>명`).join(' · ')
-    : `전체 합계 <b>${tot[0]}</b>명`;
+    ? KWS.map((k,j)=>`${esc(k)} <b>${uniq[j].size}</b>명`).join(' · ')
+    : `총 참여인원 <b>${uniq[0].size}</b>명`;
+  const dup=raw.some((r,j)=>r!==uniq[j].size);
+  $('rawsum').textContent = dup
+    ? '중복 제외 인원 · 구역별 단순 합계: '+KWS.map((k,j)=>(KWS.length>1?k+' ':'')+raw[j]+'명').join(' · ')
+    : '';
 }
 
 function apply(d,force){
